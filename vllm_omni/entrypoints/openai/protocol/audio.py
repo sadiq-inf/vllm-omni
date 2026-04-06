@@ -220,6 +220,26 @@ class StreamingSpeechSessionConfig(BaseModel):
             "'clause' also splits on CJK commas ， and semicolons ；."
         ),
     )
+    stream_mode: Literal["sentence", "clause", "chunk"] = Field(
+        default="sentence",
+        description=(
+            "Controls how text is processed before audio generation. "
+            "'sentence' and 'clause' split text at boundaries and generate "
+            "per-segment. 'chunk' bypasses splitting entirely — all text is "
+            "submitted as a single generation request and audio chunks stream "
+            "back as the codec produces them, minimising TTFA. "
+            "Requires stream_audio=true and response_format='pcm'."
+        ),
+    )
+    eager_generation: bool = Field(
+        default=False,
+        description=(
+            "When true with stream_mode='chunk', audio generation starts "
+            "on the first input.text message instead of waiting for "
+            "input.done. Subsequent input.text messages are ignored for "
+            "audio generation. Minimises TTFA for single-turn use cases."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "StreamingSpeechSessionConfig":
@@ -233,4 +253,14 @@ class StreamingSpeechSessionConfig(BaseModel):
                 self.speed = 1.0
             elif self.speed != 1.0:
                 raise ValueError("Speed adjustment is not supported when stream_audio=true. Set speed=1.0 or omit it.")
+        if self.stream_mode == "chunk":
+            if not self.stream_audio:
+                raise ValueError(
+                    "stream_mode='chunk' requires stream_audio=true."
+                )
+        if self.eager_generation:
+            if self.stream_mode != "chunk":
+                raise ValueError(
+                    "eager_generation=true requires stream_mode='chunk'."
+                )
         return self

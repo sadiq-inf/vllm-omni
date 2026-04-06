@@ -385,3 +385,270 @@ class TestStreamingSpeechWebSocket:
 
         speech_service.engine_client.abort.assert_awaited_once_with("req-abort")
         assert websocket.send_json.await_count == 2
+
+
+class TestChunkModeStreaming:
+    """Tests for stream_mode='chunk' which bypasses sentence splitting."""
+
+    def test_chunk_mode_streams_without_sentence_splitting(self):
+        """Chunk mode sends all text as a single generation request."""
+        captured_requests = []
+
+        speech_service = MagicMock(spec=OmniOpenAIServingSpeech)
+        speech_service.engine_client = MagicMock()
+        speech_service.engine_client.abort = AsyncMock()
+
+        async def mock_prepare(request):
+            captured_requests.append(request)
+            return "req-chunk", object(), {}
+
+        speech_service._prepare_speech_generation = mock_prepare
+
+        async def mock_generate_pcm_chunks(_generator, _request_id):
+            for chunk in (b"\x01\x02", b"\x03\x04\x05"):
+                yield chunk
+
+        speech_service._generate_pcm_chunks = mock_generate_pcm_chunks
+        app, _ = _build_test_app(speech_service)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "stream_mode": "chunk",
+                        "stream_audio": True,
+                        "response_format": "pcm",
+                    }
+                )
+                # Send multiple text chunks — they should be concatenated, not split
+                ws.send_json({"type": "input.text", "text": "First sentence. "})
+                ws.send_json({"type": "input.text", "text": "Second sentence. "})
+                ws.send_json({"type": "input.done"})
+
+                start = ws.receive_json()
+                assert start["type"] == "audio.start"
+                assert start["format"] == "pcm"
+                assert start["sample_rate"] == 24000
+                assert "sentence_index" not in start
+
+                assert ws.receive_bytes() == b"\x01\x02"
+                assert ws.receive_bytes() == b"\x03\x04\x05"
+
+                done = ws.receive_json()
+                assert done["type"] == "audio.done"
+                assert done["total_bytes"] == 5
+                assert done["error"] is False
+                assert "sentence_index" not in done
+
+                session_done = ws.receive_json()
+                assert session_done == {"type": "session.done"}
+
+        # Only one generation request for the full concatenated text
+        assert len(captured_requests) == 1
+        assert captured_requests[0].input == "First sentence. Second sentence. "
+        assert captured_requests[0].stream is True
+
+    def test_chunk_mode_requires_stream_audio(self):
+        """stream_mode='chunk' without stream_audio=True should be rejected."""
+        app, _ = _build_test_app()
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "stream_mode": "chunk",
+                        "stream_audio": False,
+                        "response_format": "pcm",
+                    }
+                )
+                error = ws.receive_json()
+                assert error["type"] == "error"
+                assert "stream_audio" in error["message"]
+
+    def test_chunk_mode_empty_text(self):
+        """Chunk mode with no text should send session.done without generation."""
+        app, speech_service = _build_test_app()
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "stream_mode": "chunk",
+                        "stream_audio": True,
+                        "response_format": "pcm",
+                    }
+                )
+                ws.send_json({"type": "input.done"})
+
+                session_done = ws.receive_json()
+                assert session_done == {"type": "session.done"}
+
+    def test_chunk_mode_generation_error(self):
+        """Chunk mode should report generation errors properly."""
+        speech_service = MagicMock(spec=OmniOpenAIServingSpeech)
+        speech_service._prepare_speech_generation = AsyncMock(
+            return_value=("req-chunk-err", object(), {})
+        )
+        speech_service.engine_client = MagicMock()
+        speech_service.engine_client.abort = AsyncMock()
+
+        async def mock_generate_pcm_chunks(_generator, _request_id):
+            yield b"\x01\x02"
+            raise RuntimeError("chunk boom")
+
+        speech_service._generate_pcm_chunks = mock_generate_pcm_chunks
+        app, _ = _build_test_app(speech_service)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "stream_mode": "chunk",
+                        "stream_audio": True,
+                        "response_format": "pcm",
+                    }
+                )
+                ws.send_json({"type": "input.text", "text": "Hello world"})
+                ws.send_json({"type": "input.done"})
+
+                assert ws.receive_json()["type"] == "audio.start"
+                assert ws.receive_bytes() == b"\x01\x02"
+                error = ws.receive_json()
+                assert error["type"] == "error"
+                assert "chunk boom" in error["message"]
+
+                done = ws.receive_json()
+                assert done["type"] == "audio.done"
+                assert done["total_bytes"] == 2
+                assert done["error"] is True
+
+                assert ws.receive_json() == {"type": "session.done"}
+
+    def test_sentence_mode_unchanged_with_stream_mode_param(self):
+        """Existing sentence mode works when stream_mode is explicitly 'sentence'."""
+        app, speech_service = _build_test_app()
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "voice": "Vivian",
+                        "stream_mode": "sentence",
+                    }
+                )
+                ws.send_json({"type": "input.text", "text": "Hello world. "})
+
+                start = ws.receive_json()
+                assert start["type"] == "audio.start"
+                assert start["sentence_index"] == 0
+                assert start["sentence_text"] == "Hello world."
+
+                ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+
+                ws.send_json({"type": "input.done"})
+                assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
+
+        assert speech_service._generate_audio_bytes.await_count == 1
+
+
+class TestEagerChunkModeStreaming:
+    """Tests for eager_generation=True with stream_mode='chunk'."""
+
+    def test_eager_mode_starts_audio_before_input_done(self):
+        """Audio should start flowing after first input.text, before input.done."""
+        captured_requests = []
+
+        speech_service = MagicMock(spec=OmniOpenAIServingSpeech)
+        speech_service.engine_client = MagicMock()
+        speech_service.engine_client.abort = AsyncMock()
+
+        async def mock_prepare(request):
+            captured_requests.append(request)
+            return "req-eager", object(), {}
+
+        speech_service._prepare_speech_generation = mock_prepare
+
+        async def mock_generate_pcm_chunks(_generator, _request_id):
+            for chunk in (b"\xAA\xBB", b"\xCC\xDD"):
+                yield chunk
+
+        speech_service._generate_pcm_chunks = mock_generate_pcm_chunks
+        app, _ = _build_test_app(speech_service)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "stream_mode": "chunk",
+                        "eager_generation": True,
+                        "stream_audio": True,
+                        "response_format": "pcm",
+                    }
+                )
+                # Send first text — generation starts immediately
+                ws.send_json({"type": "input.text", "text": "Hello eager world"})
+
+                start = ws.receive_json()
+                assert start["type"] == "audio.start"
+                assert start["format"] == "pcm"
+
+                assert ws.receive_bytes() == b"\xAA\xBB"
+                assert ws.receive_bytes() == b"\xCC\xDD"
+
+                done = ws.receive_json()
+                assert done["type"] == "audio.done"
+                assert done["total_bytes"] == 4
+                assert done["error"] is False
+
+                # Now send input.done to cleanly close
+                ws.send_json({"type": "input.done"})
+
+                session_done = ws.receive_json()
+                assert session_done == {"type": "session.done"}
+
+        assert len(captured_requests) == 1
+        assert captured_requests[0].input == "Hello eager world"
+
+    def test_eager_mode_requires_chunk_stream_mode(self):
+        """eager_generation=True without stream_mode='chunk' should fail."""
+        app, _ = _build_test_app()
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "eager_generation": True,
+                        "stream_mode": "sentence",
+                        "stream_audio": True,
+                        "response_format": "pcm",
+                    }
+                )
+                error = ws.receive_json()
+                assert error["type"] == "error"
+                assert "stream_mode" in error["message"]
+
+    def test_eager_mode_empty_then_done(self):
+        """Sending input.done without text should end cleanly."""
+        app, _ = _build_test_app()
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "stream_mode": "chunk",
+                        "eager_generation": True,
+                        "stream_audio": True,
+                        "response_format": "pcm",
+                    }
+                )
+                ws.send_json({"type": "input.done"})
+                assert ws.receive_json() == {"type": "session.done"}

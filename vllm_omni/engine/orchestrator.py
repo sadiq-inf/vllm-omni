@@ -104,6 +104,12 @@ class OrchestratorRequestState:
     # Metrics: timestamp when request was submitted to each stage
     stage_submit_ts: dict[int, float] = field(default_factory=dict)
 
+    # Speech playback tracking (used by deadline-aware scheduling)
+    is_speech_streaming: bool = False
+    chunk_send_timestamps: list[float] = field(default_factory=list)
+    chunk_durations: list[float] = field(default_factory=list)
+    is_pressing: bool = False
+
 
 class Orchestrator:
     """Runs inside a background thread's asyncio event loop.
@@ -122,6 +128,7 @@ class Orchestrator:
         stage_vllm_configs: list[Any],
         *,
         async_chunk: bool = False,
+        async_scheduling_overlap: bool = False,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -129,6 +136,7 @@ class Orchestrator:
 
         self.num_stages = len(stage_clients)
         self.async_chunk = bool(async_chunk)
+        self.async_scheduling_overlap = bool(async_scheduling_overlap)
 
         self.stage_clients: list[Any] = stage_clients
         self.output_processors: list[Any] = output_processors
@@ -148,6 +156,19 @@ class Orchestrator:
         self._batch_seq: list[int] = [0] * self.num_stages
         self._agg_total_tokens: list[int] = [0] * self.num_stages
         self._agg_total_gen_time_ms: list[float] = [0.0] * self.num_stages
+
+        # Detect if this is a speech/TTS pipeline (any stage produces audio)
+        self._is_speech_pipeline: bool = any(
+            getattr(sc, "final_output_type", None) == "audio"
+            for sc in self.stage_clients
+        )
+
+        # Deadline-aware scheduling for speech pipelines
+        self._speech_priority_tracker = None
+        if self._is_speech_pipeline:
+            from vllm_omni.engine.speech_scheduling import SpeechRequestPriorityTracker
+
+            self._speech_priority_tracker = SpeechRequestPriorityTracker()
 
         # Shutdown coordination
         self._shutdown_event = asyncio.Event()
@@ -230,77 +251,164 @@ class Orchestrator:
         Control flow: poll raw → process through output processor → route.
         """
         while not self._shutdown_event.is_set():
-            idle = True
-            for stage_id in range(self.num_stages):
-                if self._shutdown_event.is_set():
-                    return
+            # Update pressing status for speech requests so downstream
+            # routing can prioritise time-sensitive requests.
+            if self._speech_priority_tracker and self.request_states:
+                self._speech_priority_tracker.update_pressing_status(self.request_states)
 
-                # 1) Diffusion stage: poll non-blocking queue
-                # TODO (Peiqi): the output of diffusion stage is OmniRequestOutput,
-                # which is different from EngineCoreOutputs (LLM stages). We may want to unify
-                # the output format in the future to simplify the processing logic in Orchestrator.
-                stage_client = self.stage_clients[stage_id]
-                if stage_client.stage_type == "diffusion":
-                    output = stage_client.get_diffusion_output_nowait()
-                    if output is not None:
-                        idle = False
-                        req_state = self.request_states.get(output.request_id)
-                        if req_state is not None:
-                            stage_metrics = self._build_stage_metrics(stage_id, output.request_id, [output], req_state)
-                            await self._route_output(stage_id, output, req_state, stage_metrics)
-                    continue
-
-                # 1) Poll raw outputs from the stage
-                try:
-                    raw_outputs = await asyncio.wait_for(self._poll_stage_raw(stage_id), timeout=0.001)
-                except asyncio.TimeoutError:
-                    continue
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    if self._shutdown_event.is_set():
-                        return
-                    logger.exception(
-                        "[Orchestrator] _poll_stage_raw failed for stage-%s",
-                        stage_id,
-                    )
-                    raise
-
-                if raw_outputs is None:
-                    continue
-                idle = False
-
-                # Handle prefill-finished KV-ready signals before finished outputs.
-                await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
-
-                # 2) Process raw outputs through the output processor
-                request_outputs = await self._process_stage_outputs(stage_id, raw_outputs)
-
-                # 3) Route each processed output
-                for output in request_outputs:
-                    req_state = self.request_states.get(output.request_id)
-                    if req_state is None:
-                        logger.warning(
-                            "[Orchestrator] Dropping output for unknown req %s at stage-%s (known reqs: %s)",
-                            output.request_id,
-                            stage_id,
-                            list(self.request_states.keys()),
-                        )
-                        continue
-                    stage_metrics = None
-                    if output.finished:
-                        stage_metrics = self._build_stage_metrics(
-                            stage_id,
-                            output.request_id,
-                            [output],
-                            req_state,
-                        )
-                    await self._route_output(stage_id, output, req_state, stage_metrics)
+            if self.async_scheduling_overlap and self.num_stages > 1:
+                idle = await self._poll_stages_overlapped()
+            else:
+                idle = await self._poll_stages_sequential()
 
             if idle:
                 await asyncio.sleep(0.001)
             else:
                 await asyncio.sleep(0)
+
+    async def _poll_stages_sequential(self) -> bool:
+        """Original sequential stage polling."""
+        idle = True
+        for stage_id in range(self.num_stages):
+            if self._shutdown_event.is_set():
+                return idle
+
+            stage_client = self.stage_clients[stage_id]
+            if stage_client.stage_type == "diffusion":
+                output = stage_client.get_diffusion_output_nowait()
+                if output is not None:
+                    idle = False
+                    req_state = self.request_states.get(output.request_id)
+                    if req_state is not None:
+                        stage_metrics = self._build_stage_metrics(stage_id, output.request_id, [output], req_state)
+                        await self._route_output(stage_id, output, req_state, stage_metrics)
+                continue
+
+            try:
+                raw_outputs = await asyncio.wait_for(self._poll_stage_raw(stage_id), timeout=0.001)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if self._shutdown_event.is_set():
+                    return idle
+                logger.exception(
+                    "[Orchestrator] _poll_stage_raw failed for stage-%s",
+                    stage_id,
+                )
+                raise
+
+            if raw_outputs is None:
+                continue
+            idle = False
+
+            await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
+            request_outputs = await self._process_stage_outputs(stage_id, raw_outputs)
+
+            for output in request_outputs:
+                req_state = self.request_states.get(output.request_id)
+                if req_state is None:
+                    logger.warning(
+                        "[Orchestrator] Dropping output for unknown req %s at stage-%s (known reqs: %s)",
+                        output.request_id,
+                        stage_id,
+                        list(self.request_states.keys()),
+                    )
+                    continue
+                stage_metrics = None
+                if output.finished:
+                    stage_metrics = self._build_stage_metrics(
+                        stage_id,
+                        output.request_id,
+                        [output],
+                        req_state,
+                    )
+                await self._route_output(stage_id, output, req_state, stage_metrics)
+        return idle
+
+    async def _poll_stages_overlapped(self) -> bool:
+        """Overlapped stage polling: poll all LLM stages concurrently.
+
+        Polls are IO-bound (ZMQ recv), so issuing them in parallel reduces
+        wall-clock time when multiple stages have pending outputs.  Output
+        processing and routing are still sequential to preserve ordering.
+        """
+        idle = True
+
+        # Concurrently poll all non-diffusion stages
+        async def _poll_one(sid: int):
+            try:
+                return await asyncio.wait_for(self._poll_stage_raw(sid), timeout=0.001)
+            except asyncio.TimeoutError:
+                return None
+
+        # Handle diffusion stages first (non-blocking, no overlap needed)
+        for stage_id in range(self.num_stages):
+            if self._shutdown_event.is_set():
+                return idle
+            stage_client = self.stage_clients[stage_id]
+            if stage_client.stage_type == "diffusion":
+                output = stage_client.get_diffusion_output_nowait()
+                if output is not None:
+                    idle = False
+                    req_state = self.request_states.get(output.request_id)
+                    if req_state is not None:
+                        stage_metrics = self._build_stage_metrics(stage_id, output.request_id, [output], req_state)
+                        await self._route_output(stage_id, output, req_state, stage_metrics)
+
+        # Concurrent poll for LLM stages
+        llm_stage_ids = [
+            sid for sid in range(self.num_stages)
+            if self.stage_clients[sid].stage_type != "diffusion"
+        ]
+        if not llm_stage_ids:
+            return idle
+
+        poll_results = await asyncio.gather(
+            *[_poll_one(sid) for sid in llm_stage_ids],
+            return_exceptions=True,
+        )
+
+        # Process results in stage order (preserves ordering guarantees)
+        for stage_id, raw_outputs in zip(llm_stage_ids, poll_results):
+            if self._shutdown_event.is_set():
+                return idle
+            if isinstance(raw_outputs, Exception):
+                if isinstance(raw_outputs, asyncio.CancelledError):
+                    raise raw_outputs
+                logger.exception(
+                    "[Orchestrator] _poll_stage_raw failed for stage-%s",
+                    stage_id,
+                )
+                raise raw_outputs
+            if raw_outputs is None:
+                continue
+            idle = False
+
+            await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
+            request_outputs = await self._process_stage_outputs(stage_id, raw_outputs)
+
+            for output in request_outputs:
+                req_state = self.request_states.get(output.request_id)
+                if req_state is None:
+                    logger.warning(
+                        "[Orchestrator] Dropping output for unknown req %s at stage-%s (known reqs: %s)",
+                        output.request_id,
+                        stage_id,
+                        list(self.request_states.keys()),
+                    )
+                    continue
+                stage_metrics = None
+                if output.finished:
+                    stage_metrics = self._build_stage_metrics(
+                        stage_id,
+                        output.request_id,
+                        [output],
+                        req_state,
+                    )
+                await self._route_output(stage_id, output, req_state, stage_metrics)
+        return idle
 
     async def _route_output(
         self,
@@ -323,6 +431,10 @@ class Orchestrator:
             return
 
         if stage_client.final_output:
+            # Track audio chunk delivery for deadline-aware scheduling
+            if req_state.is_speech_streaming and not finished:
+                req_state.chunk_send_timestamps.append(_time.time())
+
             await self.output_async_queue.put(
                 {
                     "type": "output",
@@ -637,6 +749,7 @@ class Orchestrator:
             prompt=original_prompt,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
+            is_speech_streaming=self._is_speech_pipeline,
         )
         req_state.stage_submit_ts[stage_id] = _time.time()
         self.request_states[request_id] = req_state

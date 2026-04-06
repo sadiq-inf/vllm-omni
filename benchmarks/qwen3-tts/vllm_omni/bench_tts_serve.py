@@ -167,6 +167,76 @@ async def send_tts_request(
     return result
 
 
+async def send_tts_request_ws_chunk(
+    ws_url: str,
+    prompt: str,
+    task_type: str = "CustomVoice",
+    voice: str = "vivian",
+    language: str = "English",
+    pbar: tqdm | None = None,
+) -> RequestResult:
+    """Send a TTS request via WebSocket chunk mode and measure TTFA."""
+    import websockets  # type: ignore[import-untyped]
+
+    result = RequestResult(prompt=prompt)
+    st = time.perf_counter()
+
+    try:
+        async with websockets.connect(ws_url) as ws:
+            # 1. Send session.config
+            config = {
+                "type": "session.config",
+                "stream_mode": "chunk",
+                "stream_audio": True,
+                "response_format": "pcm",
+                "task_type": task_type,
+                "language": language,
+            }
+            if task_type == "CustomVoice":
+                config["voice"] = voice
+            await ws.send(json.dumps(config))
+
+            # 2. Send text + input.done
+            await ws.send(json.dumps({"type": "input.text", "text": prompt}))
+            await ws.send(json.dumps({"type": "input.done"}))
+
+            # 3. Receive audio chunks
+            first_audio = True
+            total_bytes = 0
+
+            while True:
+                msg = await ws.recv()
+                if isinstance(msg, bytes):
+                    if first_audio and len(msg) > 0:
+                        result.ttfp = time.perf_counter() - st
+                        first_audio = False
+                    total_bytes += len(msg)
+                elif isinstance(msg, str):
+                    data = json.loads(msg)
+                    if data.get("type") == "session.done":
+                        break
+                    if data.get("type") == "error":
+                        result.error = data.get("message", "unknown error")
+                        result.success = False
+                        break
+
+            result.e2e = time.perf_counter() - st
+            result.audio_bytes = total_bytes
+            result.audio_duration = pcm_bytes_to_duration(total_bytes)
+            if result.audio_duration > 0:
+                result.rtf = result.e2e / result.audio_duration
+            result.success = True
+
+    except Exception as e:
+        result.error = str(e)
+        result.success = False
+        result.e2e = time.perf_counter() - st
+
+    if pbar:
+        pbar.update(1)
+    return result
+
+
 async def run_benchmark(
     host: str,
     port: int,
@@ -176,9 +246,12 @@ async def run_benchmark(
     task_type: str = "CustomVoice",
     voice: str = "vivian",
     language: str = "English",
+    stream_mode: str = "http",
 ) -> BenchmarkResult:
     """Run benchmark at a given concurrency level."""
+    use_ws_chunk = stream_mode == "chunk"
     api_url = f"http://{host}:{port}/v1/audio/speech"
+    ws_url = f"ws://{host}:{port}/v1/audio/speech/stream"
 
     connector = aiohttp.TCPConnector(
         limit=max_concurrency,
@@ -190,7 +263,7 @@ async def run_benchmark(
         timeout=aiohttp.ClientTimeout(total=600),
     )
 
-    # Warmup
+    # Warmup (always via HTTP for simplicity)
     if num_warmups > 0:
         print(f"  Warming up with {num_warmups} requests...")
         warmup_tasks = []
@@ -204,12 +277,17 @@ async def run_benchmark(
     request_prompts = [PROMPTS[i % len(PROMPTS)] for i in range(num_prompts)]
 
     # Run benchmark
-    print(f"  Running {num_prompts} requests with concurrency={max_concurrency}...")
+    mode_label = "WebSocket chunk" if use_ws_chunk else "HTTP stream"
+    print(f"  Running {num_prompts} requests with concurrency={max_concurrency} ({mode_label})...")
     semaphore = asyncio.Semaphore(max_concurrency)
     pbar = tqdm(total=num_prompts, desc=f"  concurrency={max_concurrency}")
 
     async def limited_request(prompt):
         async with semaphore:
+            if use_ws_chunk:
+                return await send_tts_request_ws_chunk(
+                    ws_url, prompt, task_type, voice, language, pbar
+                )
             return await send_tts_request(session, api_url, prompt, task_type, voice, language, pbar)
 
     start_time = time.perf_counter()
@@ -330,6 +408,7 @@ async def main(args):
             task_type=args.task_type,
             voice=args.voice,
             language=args.language,
+            stream_mode=args.stream_mode,
         )
         result.config_name = args.config_name
         all_results.append(asdict(result))
@@ -363,6 +442,14 @@ def parse_args():
         "--config-name", type=str, default="async_chunk", help="Label for this config (used in filenames)"
     )
     parser.add_argument("--result-dir", type=str, default="results")
+    parser.add_argument(
+        "--stream-mode",
+        type=str,
+        default="http",
+        choices=["http", "chunk"],
+        help="Benchmark mode: 'http' uses /v1/audio/speech (default), "
+        "'chunk' uses WebSocket /v1/audio/speech/stream with stream_mode=chunk",
+    )
     return parser.parse_args()
 
 

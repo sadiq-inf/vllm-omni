@@ -49,6 +49,16 @@ class OmniARScheduler(VLLMScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+        # Speech priority scheduling: when enabled, pressing (deadline-
+        # aware) requests are sorted to the front of the running queue
+        # before batch composition.  Enabled when the model config
+        # indicates a speech/TTS pipeline.
+        model_config = self.vllm_config.model_config
+        self._speech_priority_enabled: bool = getattr(
+            model_config, "engine_output_type", None
+        ) == "audio" or getattr(model_config, "speech_priority", False)
+
         # Track requests that need KV cache transfer when finished
         # Value is {"seq_len": int, "block_ids": list[int]}
         self.requests_needing_kv_transfer: dict[str, dict[str, Any]] = {}
@@ -151,9 +161,30 @@ class OmniARScheduler(VLLMScheduler):
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
 
+        # Speech priority: sort running queue so pressing requests are
+        # scheduled first.  The base scheduler iterates `self.running` in
+        # order, so pressing requests will fill batch slots before
+        # non-pressing ones.  We restore the original order afterwards so
+        # persistent state (e.g. FIFO for equal-priority requests) is not
+        # disturbed.
+        saved_running_order = None
+        if self._speech_priority_enabled and len(self.running) > 1:
+            saved_running_order = list(self.running)
+            # Stable sort: pressing requests first, then original order
+            self.running.sort(
+                key=lambda req: (0 if getattr(req, "is_pressing", False) else 1),
+            )
+
         try:
             scheduler_output = super().schedule()
         finally:
+            if saved_running_order is not None:
+                # Restore the original order (minus any that were removed
+                # by the scheduler during this step).
+                current_ids = {r.request_id for r in self.running}
+                restored = [r for r in saved_running_order if r.request_id in current_ids]
+                self.running.clear()
+                self.running.extend(restored)
             if self.chunk_transfer_adapter:
                 # Add request waiting for chunk to the waiting and running queue
                 self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)

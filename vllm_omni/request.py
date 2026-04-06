@@ -44,6 +44,8 @@ class OmniRequest(Request):
         self.external_req_id: str | None = external_req_id
         # Serialized additional information payload (optional)
         self.additional_information: AdditionalInformationPayload | None = additional_information
+        # Deadline-aware scheduling: set by orchestrator for speech requests
+        self.is_pressing: bool = False
 
     @staticmethod
     def _maybe_decode_prompt_embeds(

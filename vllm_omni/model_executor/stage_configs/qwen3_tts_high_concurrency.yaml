@@ -1,3 +1,6 @@
+# High-concurrency variant of qwen3_tts.yaml for 192GB GPU.
+# Increases max_num_seqs from 10 → 128, bumps gpu_memory_utilization,
+# and raises max_num_batched_tokens for Stage 0 prefill headroom.
 async_chunk: true
 stage_args:
   - stage_id: 0
@@ -7,7 +10,7 @@ stage_args:
       devices: "0"
     engine_args:
       model_stage: qwen3_tts
-      max_num_seqs: 10
+      max_num_seqs: 128
       model_arch: Qwen3TTSTalkerForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
@@ -16,9 +19,9 @@ stage_args:
       async_scheduling: true
       enable_prefix_caching: false
       engine_output_type: latent
-      gpu_memory_utilization: 0.3
+      gpu_memory_utilization: 0.45
       distributed_executor_backend: "mp"
-      max_num_batched_tokens: 512
+      max_num_batched_tokens: 8192
       max_model_len: 4096
       custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav_async_chunk
     # Use named connector to apply runtime.connectors.extra.
@@ -39,7 +42,7 @@ stage_args:
       devices: "0"
     engine_args:
       model_stage: code2wav
-      max_num_seqs: 10
+      max_num_seqs: 128
       model_arch: Qwen3TTSCode2Wav
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
@@ -48,7 +51,7 @@ stage_args:
       async_scheduling: true
       enable_prefix_caching: false
       engine_output_type: audio
-      gpu_memory_utilization: 0.3
+      gpu_memory_utilization: 0.45
       distributed_executor_backend: "mp"
       # Must be divisible by num_code_groups and cover (left_context + chunk).
       # Prefill length is Q * num_frames (e.g. 16 * 2148 = 34368); keep headroom past 32k.
@@ -76,7 +79,7 @@ runtime:
   enabled: true
   defaults:
     window_size: -1
-    max_inflight: 10
+    max_inflight: 128
 
   connectors:
     connector_of_shared_memory:

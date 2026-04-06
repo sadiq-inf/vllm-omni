@@ -1,5 +1,6 @@
-# Qwen3-TTS batch_size=1 config (streaming with async_chunk)
+# Qwen3-TTS config (streaming with async_chunk)
 # 2-stage pipeline: Talker -> Code2Wav
+# max_num_seqs=10 for concurrent request support with low single-request latency
 async_chunk: true
 stage_args:
   - stage_id: 0
@@ -8,7 +9,7 @@ stage_args:
     runtime:
       devices: "0"
     engine_args:
-      max_num_seqs: 1
+      max_num_seqs: 10
       model_stage: qwen3_tts
       model_arch: Qwen3TTSTalkerForConditionalGeneration
       worker_type: ar
@@ -39,7 +40,7 @@ stage_args:
     runtime:
       devices: "0"
     engine_args:
-      max_num_seqs: 1
+      max_num_seqs: 10
       model_stage: code2wav
       model_arch: Qwen3TTSCode2Wav
       worker_type: generation
@@ -73,7 +74,7 @@ runtime:
   enabled: true
   defaults:
     window_size: -1
-    max_inflight: 1
+    max_inflight: 10
 
   connectors:
     connector_of_shared_memory:
